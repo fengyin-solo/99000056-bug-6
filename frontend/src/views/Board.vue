@@ -24,6 +24,7 @@
         class="columns-wrapper"
         ghost-class="column-ghost"
         animation="200"
+        @start="onColumnDragStart"
         @end="onColumnDragEnd"
       >
         <template #item="{ element: column }">
@@ -80,7 +81,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, ArrowLeft, Loading } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { useBoardStore } from '../stores/board.js'
-import { columnApi } from '../api/index.js'
 import Column from '../components/Column.vue'
 import AddCardForm from '../components/AddCardForm.vue'
 import CardDetail from '../components/CardDetail.vue'
@@ -203,20 +203,41 @@ async function confirmDeleteColumn(column) {
   }
 }
 
-async function onColumnDragEnd(evt) {
-  // Update column positions after drag
-  const columns = boardStore.columns
-  for (let i = 0; i < columns.length; i++) {
-    if (columns[i].position !== i) {
-      try {
-        await columnApi.update(columns[i].id, { position: i })
-        columns[i].position = i
-      } catch (err) {
-        // Refresh to get correct state
-        await boardStore.fetchColumns(boardStore.currentBoard.id)
-        break
-      }
-    }
+// Column drag: exactly ONE atomic reorder request per drop. Rapid drops are
+// serialized so two drops can never send interleaved per-index updates, and
+// any failure restores the server-authoritative order/cards.
+const columnDrag = { orderBefore: null, chain: Promise.resolve() }
+
+function onColumnDragStart() {
+  columnDrag.orderBefore = boardStore.columns.map(c => c.id)
+}
+
+async function onColumnDragEnd() {
+  const orderedIds = boardStore.columns.map(c => c.id)
+  const before = columnDrag.orderBefore
+  columnDrag.orderBefore = null
+
+  // No actual move (dropped in place) — nothing to persist.
+  if (!before || orderedIds.length === before.length &&
+      orderedIds.every((id, i) => id === before[i])) {
+    return
+  }
+
+  const boardId = boardStore.currentBoard.id
+  const wanted = orderedIds
+
+  columnDrag.chain = columnDrag.chain
+    .then(() => boardStore.reorderColumns(boardId, wanted))
+    .catch(async () => {
+      // The DB is the truth: rebuild both columns and card buckets.
+      await boardStore.fetchColumns(boardId)
+      await boardStore.fetchAllCards(boardId)
+    })
+
+  try {
+    await columnDrag.chain
+  } catch {
+    /* already recovered inside the chain */
   }
 }
 </script>

@@ -32,10 +32,12 @@
         group="cards"
         ghost-class="card-ghost"
         animation="200"
+        :data-column-id="column.id"
         @end="onCardDragEnd"
       >
         <template #item="{ element: card }">
           <TaskCard
+            :data-card-id="card.id"
             :card="card"
             :all-columns="allColumns"
             @edit="$emit('edit-card', card)"
@@ -59,7 +61,9 @@ import { ref, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
+import { useBoardStore } from '../stores/board.js'
+
+const boardStore = useBoardStore()
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -96,24 +100,34 @@ function handleCommand(command) {
   }
 }
 
+// Every card drag (same-column reorder AND cross-column move) goes through
+// the store -> one canonical server move -> full server-side reconciliation.
+// Sortable fires `end` on the source list (and sometimes the target for a
+// cross-list drop); the store coalesces duplicate calls per card id.
 async function onCardDragEnd(evt) {
-  const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
-  if (!cardId) return
-  
-  const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
+  // Identify the card and the source/target columns via stable DOM data
+  // attributes instead of vuedraggable internals.
+  const cardId = Number(evt.item?.dataset?.cardId
+    ?? evt.item?.parentElement?.dataset?.cardId)
+  const fromColumnId = Number(evt.from?.dataset?.columnId)
+  const toColumnId = Number(evt.to?.dataset?.columnId)
+  const newIndex = Number.isInteger(evt.newIndex) ? evt.newIndex : 0
+
+  if (!cardId || !toColumnId) return
+  // Sortable fires `end` on the source list; only the source (or, in some
+  // versions, the target as well) should act on it. Duplicates for the same
+  // card are coalesced by the store, but still filter unrelated instances.
+  if (props.column.id !== fromColumnId && props.column.id !== toColumnId) {
+    return
+  }
+
+  try {
+    await boardStore.moveCard(cardId, toColumnId, newIndex)
+  } catch {
+    // Rebuild from the server so the board cannot stay visually mismatched.
+    if (boardStore.currentBoard) {
+      await boardStore.fetchColumns(boardStore.currentBoard.id)
+      await boardStore.fetchAllCards(boardStore.currentBoard.id)
     }
   }
 }

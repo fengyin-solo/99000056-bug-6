@@ -44,6 +44,8 @@ export const boardApi = {
 export const columnApi = {
   list: (boardId) => api.get(`/boards/${boardId}/columns`),
   create: (boardId, name) => api.post(`/boards/${boardId}/columns`, { name }),
+  reorder: (boardId, columnIds) =>
+    api.put(`/boards/${boardId}/columns/reorder`, { columnIds }),
   update: (id, data) => api.put(`/columns/${id}`, data),
   delete: (id) => api.delete(`/columns/${id}`)
 }
