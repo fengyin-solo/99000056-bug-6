@@ -35,6 +35,7 @@
             @edit-card="openCardDetail"
             @delete-card="confirmDeleteCard"
             @move-card="handleMoveCard"
+            @reorder-cards="handleReorderCards"
             @rename-column="handleRenameColumn"
             @delete-column="confirmDeleteColumn"
           />
@@ -80,7 +81,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, ArrowLeft, Loading } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { useBoardStore } from '../stores/board.js'
-import { columnApi } from '../api/index.js'
 import Column from '../components/Column.vue'
 import AddCardForm from '../components/AddCardForm.vue'
 import CardDetail from '../components/CardDetail.vue'
@@ -176,6 +176,16 @@ async function handleMoveCard(cardId, targetColumnId, position) {
   }
 }
 
+// Card drag end (cross-column or same-column reorder). No toast on success:
+// the drop itself is the feedback. The store reloads the board on failure.
+async function handleReorderCards(cardId, targetColumnId, position) {
+  try {
+    await boardStore.moveCard(cardId, targetColumnId, position)
+  } catch (err) {
+    ElMessage.error('Failed to move card')
+  }
+}
+
 async function handleRenameColumn(columnId, newName) {
   try {
     await boardStore.renameColumn(columnId, newName)
@@ -204,19 +214,22 @@ async function confirmDeleteColumn(column) {
 }
 
 async function onColumnDragEnd(evt) {
-  // Update column positions after drag
-  const columns = boardStore.columns
-  for (let i = 0; i < columns.length; i++) {
-    if (columns[i].position !== i) {
-      try {
-        await columnApi.update(columns[i].id, { position: i })
-        columns[i].position = i
-      } catch (err) {
-        // Refresh to get correct state
-        await boardStore.fetchColumns(boardStore.currentBoard.id)
-        break
-      }
-    }
+  // vuedraggable has already placed boardStore.columns in the new visual
+  // order. One dragged column changes position; the store derives every
+  // other position from the same canonical array-order rule and syncs with
+  // a single API call, reloading the board if that fails.
+  if (evt.oldIndex === evt.newIndex) return
+
+  const colId =
+    evt.item?.__draggable_context?.element?.id ??
+    boardStore.columns[evt.newIndex]?.id
+
+  if (colId === undefined) return
+
+  try {
+    await boardStore.reorderColumn(colId)
+  } catch (err) {
+    ElMessage.error('Failed to reorder columns')
   }
 }
 </script>

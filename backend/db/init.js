@@ -16,6 +16,34 @@ function getDb() {
   return db;
 }
 
+// Canonical position rule: position is the dense 0-based index of a column
+// within its board, and of a card within its column, defined solely by the
+// current ORDER BY position, id ranking. Every entry point (drag, delete,
+// create, move) converges to this rule; this migration also repairs any gaps
+// or duplicate positions left by older data.
+function normalizePositions(db) {
+  const renumber = db.transaction(() => {
+    const boards = db.prepare('SELECT id FROM boards ORDER BY id').all();
+    const updateColumn = db.prepare('UPDATE columns SET position = ? WHERE id = ?');
+    for (const board of boards) {
+      const cols = db
+        .prepare('SELECT id FROM columns WHERE board_id = ? ORDER BY position ASC, id ASC')
+        .all(board.id);
+      cols.forEach((col, i) => updateColumn.run(i, col.id));
+    }
+
+    const columns = db.prepare('SELECT id FROM columns ORDER BY id').all();
+    const updateCard = db.prepare('UPDATE cards SET position = ? WHERE id = ?');
+    for (const col of columns) {
+      const cards = db
+        .prepare('SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC, id ASC')
+        .all(col.id);
+      cards.forEach((card, i) => updateCard.run(i, card.id));
+    }
+  });
+  renumber();
+}
+
 function initDb() {
   const db = getDb();
 
@@ -59,7 +87,9 @@ function initDb() {
     );
   `);
 
+  normalizePositions(db);
+
   return db;
 }
 
-module.exports = { getDb, initDb };
+module.exports = { getDb, initDb, normalizePositions };

@@ -32,6 +32,7 @@
         group="cards"
         ghost-class="card-ghost"
         animation="200"
+        :data-column-id="column.id"
         @end="onCardDragEnd"
       >
         <template #item="{ element: card }">
@@ -59,7 +60,6 @@ import { ref, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -67,7 +67,7 @@ const props = defineProps({
   allColumns: { type: Array, default: () => [] }
 })
 
-const emit = defineEmits(['add-card', 'edit-card', 'delete-card', 'move-card', 'rename-column', 'delete-column'])
+const emit = defineEmits(['add-card', 'edit-card', 'delete-card', 'move-card', 'reorder-cards', 'rename-column', 'delete-column'])
 
 const isEditing = ref(false)
 const editName = ref('')
@@ -97,25 +97,20 @@ function handleCommand(command) {
 }
 
 async function onCardDragEnd(evt) {
+  // Sortable fires `end` on the SOURCE list, so props.column.id is the
+  // source column — never the destination. The real destination is read
+  // from evt.to (tagged with data-column-id via attribute fallthrough).
   const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
   if (!cardId) return
-  
+
+  const fromColumnId = Number(evt.from?.dataset?.columnId ?? props.column.id)
+  const toColumnId = Number(evt.to?.dataset?.columnId ?? props.column.id)
   const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
-    }
-  }
+
+  if (fromColumnId === toColumnId && evt.oldIndex === newIndex) return
+
+  // One canonical event for both cross-column drag and same-column reorder.
+  emit('reorder-cards', cardId, toColumnId, newIndex)
 }
 </script>
 

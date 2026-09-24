@@ -9,7 +9,7 @@ router.use(authMiddleware);
 // Helper: verify card ownership through column -> board -> user
 function getCardWithOwnership(db, cardId, userId) {
   return db.prepare(`
-    SELECT c.*, col.board_id, b.user_id 
+    SELECT c.*, col.board_id, b.user_id
     FROM cards c
     JOIN columns col ON c.column_id = col.id
     JOIN boards b ON col.board_id = b.id
@@ -19,11 +19,23 @@ function getCardWithOwnership(db, cardId, userId) {
 
 function verifyColumnOwnership(db, columnId, userId) {
   return db.prepare(`
-    SELECT col.*, b.user_id 
-    FROM columns col 
-    JOIN boards b ON col.board_id = b.id 
+    SELECT col.*, b.user_id
+    FROM columns col
+    JOIN boards b ON col.board_id = b.id
     WHERE col.id = ?
   `).get(columnId, userId);
+}
+
+// Canonical position rule for cards, identical in spirit to the column rule:
+// dense 0-based index inside a column. Return the number of cards in a column
+// excluding optionally one card (used when the moved card still occupies a slot).
+function cardCount(db, columnId, excludeCardId = null) {
+  const row = excludeCardId
+    ? db
+        .prepare('SELECT COUNT(*) AS cnt FROM cards WHERE column_id = ? AND id != ?')
+        .get(columnId, excludeCardId)
+    : db.prepare('SELECT COUNT(*) AS cnt FROM cards WHERE column_id = ?').get(columnId);
+  return row.cnt;
 }
 
 // GET /api/columns/:columnId/cards - Get cards in column
@@ -31,8 +43,8 @@ router.get('/columns/:columnId/cards', (req, res) => {
   const db = getDb();
   try {
     const col = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
+      SELECT col.*, b.user_id FROM columns col
+      JOIN boards b ON col.board_id = b.id
       WHERE col.id = ?
     `).get(req.params.columnId);
 
@@ -42,9 +54,9 @@ router.get('/columns/:columnId/cards', (req, res) => {
     }
 
     const cards = db.prepare(`
-      SELECT * FROM cards 
-      WHERE column_id = ? 
-      ORDER BY position ASC
+      SELECT * FROM cards
+      WHERE column_id = ?
+      ORDER BY position ASC, id ASC
     `).all(req.params.columnId);
 
     db.close();
@@ -65,8 +77,8 @@ router.post('/columns/:columnId/cards', (req, res) => {
   const db = getDb();
   try {
     const col = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
+      SELECT col.*, b.user_id FROM columns col
+      JOIN boards b ON col.board_id = b.id
       WHERE col.id = ?
     `).get(req.params.columnId);
 
@@ -75,12 +87,11 @@ router.post('/columns/:columnId/cards', (req, res) => {
       return res.status(404).json({ error: 'Column not found' });
     }
 
-    // Get max position in this column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(req.params.columnId);
-    const newPosition = (maxPos.maxPos ?? -1) + 1;
+    // Append at the canonical end position: current card count.
+    const newPosition = cardCount(db, req.params.columnId);
 
     const result = db.prepare(`
-      INSERT INTO cards (column_id, title, description, priority, due_date, position) 
+      INSERT INTO cards (column_id, title, description, priority, due_date, position)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(
       req.params.columnId,
@@ -146,13 +157,15 @@ router.delete('/cards/:id', (req, res) => {
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    db.prepare('DELETE FROM cards WHERE id = ?').run(req.params.id);
-
-    // Reorder remaining cards in the column
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(card.column_id, card.position);
+    const applyDelete = db.transaction(() => {
+      db.prepare('DELETE FROM cards WHERE id = ?').run(req.params.id);
+      // Renumber remaining cards in the column atomically.
+      db.prepare(`
+        UPDATE cards SET position = position - 1
+        WHERE column_id = ? AND position > ?
+      `).run(card.column_id, card.position);
+    });
+    applyDelete();
 
     db.close();
     res.json({ message: 'Card deleted' });
@@ -162,11 +175,17 @@ router.delete('/cards/:id', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id/move - Move card to another column
+// PUT /api/cards/:id/move - Move card to another position/column.
+// One canonical entry point for both cross-column drag and same-column
+// reorder: positions are dense 0-based indexes, clamped into the range of
+// the destination column after the moved card is conceptually removed.
 router.put('/cards/:id/move', (req, res) => {
   const { columnId, position } = req.body;
   if (!columnId) {
     return res.status(400).json({ error: 'Target column ID is required' });
+  }
+  if (position !== undefined && !Number.isInteger(position)) {
+    return res.status(400).json({ error: 'Position must be an integer' });
   }
 
   const db = getDb();
@@ -179,8 +198,8 @@ router.put('/cards/:id/move', (req, res) => {
 
     // Verify target column belongs to same board and user
     const targetCol = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
+      SELECT col.*, b.user_id FROM columns col
+      JOIN boards b ON col.board_id = b.id
       WHERE col.id = ? AND col.board_id = ?
     `).get(columnId, card.board_id);
 
@@ -192,27 +211,44 @@ router.put('/cards/:id/move', (req, res) => {
     const oldColumnId = card.column_id;
     const oldPosition = card.position;
 
-    // Get max position in target column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(columnId);
-    const newPosition = position !== undefined ? Math.min(position, (maxPos.maxPos ?? -1) + 1) : (maxPos.maxPos ?? -1) + 1;
+    const applyMove = db.transaction(() => {
+      // Valid drop slots are 0..countOfOtherCardsInTarget
+      const otherCards = cardCount(db, columnId, req.params.id);
+      const requested = position === undefined ? otherCards : position;
+      const newPosition = Math.max(0, Math.min(requested, otherCards));
 
-    // Remove card from old position (shift cards down in old column)
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(oldColumnId, oldPosition);
+      if (oldColumnId === columnId) {
+        if (oldPosition === newPosition) return;
+        if (newPosition > oldPosition) {
+          db.prepare(`
+            UPDATE cards SET position = position - 1
+            WHERE column_id = ? AND id != ? AND position > ? AND position <= ?
+          `).run(columnId, req.params.id, oldPosition, newPosition);
+        } else {
+          db.prepare(`
+            UPDATE cards SET position = position + 1
+            WHERE column_id = ? AND id != ? AND position >= ? AND position < ?
+          `).run(columnId, req.params.id, newPosition, oldPosition);
+        }
+      } else {
+        // Remove from old column
+        db.prepare(`
+          UPDATE cards SET position = position - 1
+          WHERE column_id = ? AND position > ?
+        `).run(oldColumnId, oldPosition);
+        // Make room in target column
+        db.prepare(`
+          UPDATE cards SET position = position + 1
+          WHERE column_id = ? AND position >= ?
+        `).run(columnId, newPosition);
+      }
 
-    // Make room in target column (shift cards up in target column)
-    db.prepare(`
-      UPDATE cards SET position = position + 1 
-      WHERE column_id = ? AND position >= ?
-    `).run(columnId, newPosition);
-
-    // Move the card
-    db.prepare(`
-      UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') 
-      WHERE id = ?
-    `).run(columnId, newPosition, req.params.id);
+      db.prepare(`
+        UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(columnId, newPosition, req.params.id);
+    });
+    applyMove();
 
     const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
     db.close();

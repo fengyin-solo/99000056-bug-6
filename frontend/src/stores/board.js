@@ -9,6 +9,33 @@ export const useBoardStore = defineStore('board', () => {
   const cards = ref({}) // keyed by columnId -> [cards]
   const loading = ref(false)
 
+  // Canonical position rule (single source of truth for every entry point):
+  // position is the dense 0-based index of a column inside its board, and of
+  // a card inside its column. The array ordering defines the position; after
+  // any drag/delete/create operation the local state is normalized to match
+  // the array order BEFORE syncing, and on any sync failure the whole board
+  // is reloaded so the UI can never diverge from the server.
+  function normalizeColumnPositions() {
+    columns.value.forEach((col, i) => {
+      col.position = i
+    })
+  }
+
+  function normalizeCardPositions(columnId) {
+    const list = cards.value[columnId]
+    if (list) {
+      list.forEach((card, i) => {
+        card.column_id = columnId
+        card.position = i
+      })
+    }
+  }
+
+  async function reloadBoard(boardId) {
+    await fetchColumns(boardId)
+    await fetchAllCards(boardId)
+  }
+
   // Board actions
   async function fetchBoards() {
     loading.value = true
@@ -37,11 +64,12 @@ export const useBoardStore = defineStore('board', () => {
     try {
       const res = await columnApi.list(boardId)
       columns.value = res.data
-      // Initialize cards map
-      cards.value = {}
+      // Reconcile the cards map without discarding already-loaded cards.
+      const nextCards = {}
       for (const col of res.data) {
-        cards.value[col.id] = []
+        nextCards[col.id] = cards.value[col.id] || []
       }
+      cards.value = nextCards
     } finally {
       loading.value = false
     }
@@ -50,6 +78,8 @@ export const useBoardStore = defineStore('board', () => {
   async function addColumn(boardId, name) {
     const res = await columnApi.create(boardId, name)
     columns.value.push(res.data)
+    // Server appends at the end; the array order is the canonical order.
+    normalizeColumnPositions()
     cards.value[res.data.id] = []
     return res.data
   }
@@ -57,23 +87,45 @@ export const useBoardStore = defineStore('board', () => {
   async function renameColumn(colId, name) {
     const res = await columnApi.update(colId, { name })
     const idx = columns.value.findIndex(c => c.id === colId)
-    if (idx !== -1) columns.value[idx] = res.data
+    if (idx !== -1) {
+      // Merge server data but keep the local canonical position/order.
+      columns.value[idx] = { ...columns.value[idx], ...res.data, position: idx }
+    }
     return res.data
   }
 
   async function deleteColumn(colId) {
-    await columnApi.delete(colId)
+    try {
+      await columnApi.delete(colId)
+    } catch (err) {
+      if (currentBoard.value) await reloadBoard(currentBoard.value.id)
+      throw err
+    }
     columns.value = columns.value.filter(c => c.id !== colId)
     delete cards.value[colId]
+    // Local positions must be renumbered locally as well: otherwise the next
+    // drag would judge stale positions and skip required updates.
+    normalizeColumnPositions()
   }
 
-  async function reorderColumn(colId, newPosition) {
-    const res = await columnApi.update(colId, { position: newPosition })
-    // Refresh columns to get correct order
-    if (currentBoard.value) {
-      await fetchColumns(currentBoard.value.id)
+  // The caller has already arranged columns.value in the desired visual
+  // order (vuedraggable mutates the array in place). Move exactly the one
+  // dragged column to its canonical index; positions of the other columns
+  // derive from the same array-order rule. On failure, reload everything.
+  async function reorderColumn(colId) {
+    const newPosition = columns.value.findIndex(c => c.id === colId)
+    if (newPosition === -1) return
+    normalizeColumnPositions()
+    try {
+      const res = await columnApi.update(colId, { position: newPosition })
+      const idx = columns.value.findIndex(c => c.id === colId)
+      if (idx !== -1) {
+        columns.value[idx] = { ...columns.value[idx], ...res.data, position: newPosition }
+      }
+    } catch (err) {
+      if (currentBoard.value) await reloadBoard(currentBoard.value.id)
+      throw err
     }
-    return res.data
   }
 
   // Card actions
@@ -84,19 +136,21 @@ export const useBoardStore = defineStore('board', () => {
   }
 
   async function fetchAllCards(boardId) {
-    // Fetch cards for all columns in parallel
     const cols = columns.value
     const promises = cols.map(col => cardApi.list(col.id))
     const results = await Promise.all(promises)
+    const nextCards = {}
     cols.forEach((col, i) => {
-      cards.value[col.id] = results[i].data
+      nextCards[col.id] = results[i].data
     })
+    cards.value = nextCards
   }
 
   async function addCard(columnId, data) {
     const res = await cardApi.create(columnId, data)
     if (!cards.value[columnId]) cards.value[columnId] = []
     cards.value[columnId].push(res.data)
+    normalizeCardPositions(columnId)
     return res.data
   }
 
@@ -114,31 +168,59 @@ export const useBoardStore = defineStore('board', () => {
   }
 
   async function deleteCard(cardId) {
-    await cardApi.delete(cardId)
-    for (const colId in cards.value) {
-      cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
+    try {
+      await cardApi.delete(cardId)
+    } catch (err) {
+      if (currentBoard.value) await reloadBoard(currentBoard.value.id)
+      throw err
     }
+    let deletedFrom = null
+    for (const colId in cards.value) {
+      const before = cards.value[colId].length
+      cards.value[colId] = cards.value[colId].filter(c => c.id !== cardId)
+      if (cards.value[colId].length !== before) deletedFrom = colId
+    }
+    if (deletedFrom !== null) normalizeCardPositions(deletedFrom)
   }
 
+  // Single canonical entry for card moves: same-column reorder, cross-column
+  // drag and the dropdown/detail "Move to..." all go through here. The local
+  // arrays are reordered to match the visual drop order first, positions are
+  // normalized from array indexes, then synced in one API call.
   async function moveCard(cardId, targetColumnId, position) {
-    const res = await cardApi.move(cardId, targetColumnId, position)
-    // Remove card from old column and add to new column
-    let movedCard = null
-    for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
-      if (idx !== -1) {
-        movedCard = cards.value[colId].splice(idx, 1)[0]
-        break
-      }
+    const sourceListKey = Object.keys(cards.value).find(
+      colId => cards.value[colId].some(c => c.id === cardId)
+    )
+    if (sourceListKey === undefined) {
+      if (currentBoard.value) await reloadBoard(currentBoard.value.id)
+      throw new Error('Card not found in local board state')
     }
-    if (movedCard) {
-      movedCard.column_id = targetColumnId
-      movedCard.position = position
-      if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
-      // Insert at position
-      cards.value[targetColumnId].splice(position, 0, movedCard)
+
+    const sourceList = cards.value[sourceListKey]
+    const fromIndex = sourceList.findIndex(c => c.id === cardId)
+    const movedCard = sourceList.splice(fromIndex, 1)[0]
+
+    if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
+    const targetList = cards.value[targetColumnId]
+    // Clamp the drop index into the valid slots of the target list; the
+    // server applies the identical rule.
+    const clamped = Math.max(0, Math.min(position ?? targetList.length, targetList.length))
+    targetList.splice(clamped, 0, movedCard)
+
+    normalizeCardPositions(Number(sourceListKey))
+    if (Number(sourceListKey) !== targetColumnId) normalizeCardPositions(targetColumnId)
+
+    try {
+      const res = await cardApi.move(cardId, targetColumnId, clamped)
+      // Adopt the server's canonical record for the moved card.
+      const finalList = cards.value[targetColumnId]
+      const idx = finalList.findIndex(c => c.id === cardId)
+      if (idx !== -1) finalList[idx] = res.data
+    } catch (err) {
+      if (currentBoard.value) await reloadBoard(currentBoard.value.id)
+      throw err
     }
-    return res.data
+    return movedCard
   }
 
   function clearBoard() {
@@ -152,6 +234,6 @@ export const useBoardStore = defineStore('board', () => {
     fetchBoards, createBoard, deleteBoard,
     fetchColumns, addColumn, renameColumn, deleteColumn, reorderColumn,
     fetchCards, fetchAllCards, addCard, updateCard, deleteCard, moveCard,
-    clearBoard
+    reloadBoard, clearBoard
   }
 })
